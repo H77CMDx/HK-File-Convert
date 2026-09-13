@@ -1,6 +1,6 @@
 # HK File Converter
 
-HK File Converter is an offline Windows desktop application for batch-converting media and common office files. It uses a PySide6 interface with drag-and-drop support and performs conversions locally on your computer (This means that the process does not require an internet connection). 
+HK File Converter is an offline Windows desktop application for batch-converting media and common office files. It uses a PySide6 interface with drag-and-drop support and performs conversions locally on your computer.
 
 ## Download
 
