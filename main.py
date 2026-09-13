@@ -4,24 +4,30 @@ Fully offline desktop file converter with a modern PySide6 GUI.
 Partially vibe coded : Claude Sonnet 5, GPT 5.6 Luna
 
 Supports:
-    - Images  (via Pillow)
-    - Audio   (via FFmpeg, bundled through imageio-ffmpeg, or system ffmpeg)
-    - Video   (via FFmpeg, same as above)
-    - PDF     (via PyMuPDF / pypdfium2 for rendering; Pillow for image->PDF)
+    - Images       (via Pillow)
+    - Audio/Video  (via FFmpeg, bundled through imageio-ffmpeg, or system ffmpeg)
+    - PDF          (via PyMuPDF / pypdfium2 for rendering; Pillow for image->PDF)
+    - Documents    (docx/odt/txt/md  -> pdf/odt/docx/txt/html/md)
+    - Spreadsheets (xlsx/ods/csv/tsv -> pdf/ods/xlsx/csv/tsv/html/json)
+    - Presentations(pptx/odp         -> pdf/odp/pptx/txt/html)
 
 Pip dependencies:
     pip install PySide6 Pillow imageio-ffmpeg
-    pip install pymupdf          # preferred PDF backend
-    # or, if pymupdf is unavailable on your platform:
-    pip install pypdfium2
+    pip install pymupdf          # preferred PDF backend (or: pypdfium2)
+
+    # Office / document conversion (pure python):
+    pip install python-docx openpyxl python-pptx odfpy fpdf2
+
+    # Optional image formats:
+    pip install pillow-heif pillow-avif-plugin
 
 Run:
-    python converter.py
+    python main.py
 
-The app is designed to degrade gracefully: if an optional backend (ffmpeg,
-pymupdf/pypdfium2, or extra Pillow plugins for heic/avif) is missing, the
-corresponding features are disabled with a clear, actionable message instead
-of the app crashing.
+The app is designed to degrade gracefully: if an optional backend is missing,
+the corresponding features are disabled with a clear, actionable message
+instead of the app crashing. Backend *detection* is done without actually
+importing the heavy libraries, which makes startup much faster.
 """
 
 from __future__ import annotations
@@ -35,6 +41,8 @@ import logging
 import platform
 import subprocess
 import traceback
+import importlib.util
+import importlib.metadata
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -60,85 +68,63 @@ from PySide6.QtWidgets import (
 )
 
 # --------------------------------------------------------------------------
-# Optional backend imports (never fail hard on missing packages)
+# Fast, lazy backend detection.
+#
+# We only check whether the *module spec* is resolvable - we never actually
+# import the heavy libraries at startup. That's the single biggest startup
+# win: importing Pillow, PyMuPDF and imageio-ffmpeg costs several hundred ms.
+# The real imports happen on-demand inside the conversion functions (Python
+# caches module imports, so repeat lookups are cheap).
 # --------------------------------------------------------------------------
 
-try:
-    from PIL import Image, ImageOps, ImageSequence
-    PIL_AVAILABLE = True
+def _module_available(name: str) -> bool:
     try:
-        PIL_VERSION = __import__("PIL").__version__
+        return importlib.util.find_spec(name) is not None
     except Exception:
-        PIL_VERSION = "unknown"
-except Exception:
-    PIL_AVAILABLE = False
-    PIL_VERSION = None
+        return False
 
-HEIC_SUPPORTED = False
-AVIF_SUPPORTED = False
-if PIL_AVAILABLE:
-    try:
-        import pillow_heif  # noqa: F401
-        pillow_heif.register_heif_opener()
-        HEIC_SUPPORTED = True
-    except Exception:
-        HEIC_SUPPORTED = False
-    try:
-        import pillow_avif  # noqa: F401
-        AVIF_SUPPORTED = True
-    except Exception:
-        # Some Pillow builds have native avif support baked in.
-        try:
-            Image.new("RGB", (1, 1)).save(
-                Path.home() / ".fc_avif_probe.avif"
-            )
-            AVIF_SUPPORTED = True
-            try:
-                (Path.home() / ".fc_avif_probe.avif").unlink(missing_ok=True)
-            except Exception:
-                pass
-        except Exception:
-            AVIF_SUPPORTED = False
 
-try:
-    import imageio_ffmpeg
-    IMAGEIO_FFMPEG_AVAILABLE = True
-except Exception:
-    IMAGEIO_FFMPEG_AVAILABLE = False
-
-PYMUPDF_AVAILABLE = False
-PYPDFIUM2_AVAILABLE = False
-try:
-    import pymupdf
-    PYMUPDF_AVAILABLE = True
+def _pkg_version(pypi_name: str) -> Optional[str]:
     try:
-        PYMUPDF_VERSION = pymupdf.__doc__ or pymupdf.VersionBind
+        return importlib.metadata.version(pypi_name)
     except Exception:
-        PYMUPDF_VERSION = "unknown"
-except Exception:
-    try:
-        import pypdfium2 as pdfium
-        PYPDFIUM2_AVAILABLE = True
-    except Exception:
-        PYPDFIUM2_AVAILABLE = False
+        return None
 
+
+# Image backend
+PIL_AVAILABLE = _module_available("PIL")
+HEIC_SUPPORTED = PIL_AVAILABLE and _module_available("pillow_heif")
+AVIF_SUPPORTED = PIL_AVAILABLE and _module_available("pillow_avif")
+
+# FFmpeg
+IMAGEIO_FFMPEG_AVAILABLE = _module_available("imageio_ffmpeg")
+
+# PDF read backend
+PYMUPDF_AVAILABLE = _module_available("pymupdf")
+PYPDFIUM2_AVAILABLE = (not PYMUPDF_AVAILABLE) and _module_available("pypdfium2")
 PDF_AVAILABLE = PYMUPDF_AVAILABLE or PYPDFIUM2_AVAILABLE
 
-APP_NAME = "File Converter"
-ORG_NAME = "OfflineTools"
+# PDF write backend (pure python)
+FPDF2_AVAILABLE = _module_available("fpdf")
+
+# Office backends (pure python)
+DOCX_AVAILABLE = _module_available("docx")
+OPENPYXL_AVAILABLE = _module_available("openpyxl")
+PPTX_AVAILABLE = _module_available("pptx")
+ODFPY_AVAILABLE = _module_available("odf")
+
+APP_NAME = "HK File Converter"
+ORG_NAME = "HK Software"
 
 
 # --------------------------------------------------------------------------
 # SVG icons (no emoji anywhere in the UI)
 # --------------------------------------------------------------------------
-# Every icon is a small inline SVG string rendered to a QIcon at the requested
-# size/color. Colors are hardcoded to match the app's single dark theme.
 
 _ICON_CACHE: dict[tuple[str, int], QIcon] = {}
 
 
 def svg_icon(svg_source: str, size: int = 16) -> QIcon:
-    """Render an inline SVG string to a QIcon at the given pixel size (cached)."""
     key = (svg_source, size)
     cached = _ICON_CACHE.get(key)
     if cached is not None:
@@ -219,6 +205,18 @@ PDF_OUTPUT_IMAGE_FORMATS = [
     "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "ico",
 ]
 
+# --- Document (Word-like) ---------------------------------------------------
+DOCUMENT_INPUT_FORMATS = ["docx", "odt", "txt", "md"]
+DOCUMENT_OUTPUT_FORMATS = ["pdf", "odt", "docx", "txt", "html", "md"]
+
+# --- Spreadsheet (Excel-like) ----------------------------------------------
+SPREADSHEET_INPUT_FORMATS = ["xlsx", "ods", "csv", "tsv"]
+SPREADSHEET_OUTPUT_FORMATS = ["pdf", "ods", "xlsx", "csv", "tsv", "html", "json"]
+
+# --- Presentation (PowerPoint-like) ----------------------------------------
+PRESENTATION_INPUT_FORMATS = ["pptx", "odp"]
+PRESENTATION_OUTPUT_FORMATS = ["pdf", "odp", "pptx", "txt", "html"]
+
 ICO_SIZES = [16, 32, 48, 64, 128, 256]
 
 FFMPEG_CONTAINER_CODEC_HINTS = {
@@ -237,7 +235,6 @@ FFMPEG_CONTAINER_CODEC_HINTS = {
 
 
 def category_of_ext(ext: str) -> str:
-    """Return the category name ('image', 'audio', 'video', 'pdf', 'unknown') for a lowercase extension (no dot)."""
     ext = ext.lower().lstrip(".")
     if ext in IMAGE_INPUT_FORMATS:
         return "image"
@@ -247,6 +244,12 @@ def category_of_ext(ext: str) -> str:
         return "video"
     if ext in PDF_INPUT_FORMATS:
         return "pdf"
+    if ext in DOCUMENT_INPUT_FORMATS:
+        return "document"
+    if ext in SPREADSHEET_INPUT_FORMATS:
+        return "spreadsheet"
+    if ext in PRESENTATION_INPUT_FORMATS:
+        return "presentation"
     return "unknown"
 
 
@@ -260,18 +263,22 @@ def valid_targets_for(ext: str) -> list[str]:
         return list(VIDEO_FORMATS)
     if cat == "pdf":
         return list(PDF_OUTPUT_IMAGE_FORMATS)
+    if cat == "document":
+        return list(DOCUMENT_OUTPUT_FORMATS)
+    if cat == "spreadsheet":
+        return list(SPREADSHEET_OUTPUT_FORMATS)
+    if cat == "presentation":
+        return list(PRESENTATION_OUTPUT_FORMATS)
     return []
 
 
 def common_valid_targets(exts: list[str]) -> list[str]:
-    """Intersection of valid targets across a list of source extensions."""
     if not exts:
         return []
     sets = [set(valid_targets_for(e)) for e in exts]
     common = sets[0]
     for s in sets[1:]:
         common &= s
-    # Preserve a stable, sensible order using the first list as reference.
     ordered = [f for f in valid_targets_for(exts[0]) if f in common]
     return ordered
 
@@ -289,7 +296,6 @@ def sanitize_filename(name: str) -> str:
 
 
 def unique_path(path: Path) -> Path:
-    """Return a path that does not already exist, appending ' (1)', ' (2)', ... as needed."""
     if not path.exists():
         return path
     stem, suffix, parent = path.stem, path.suffix, path.parent
@@ -310,7 +316,6 @@ def human_size(num_bytes: float) -> str:
 
 
 def parse_page_range(spec: str, page_count: int) -> list[int]:
-    """Parse a page-range spec like 'all', '1-5', '2,4,7' into a 0-indexed page list."""
     spec = (spec or "all").strip().lower()
     if spec in ("", "all", "*"):
         return list(range(page_count))
@@ -338,20 +343,38 @@ def parse_page_range(spec: str, page_count: int) -> list[int]:
     return sorted(pages) if pages else list(range(page_count))
 
 
+def _latin1(s: Any) -> str:
+    """Force text into Latin-1 so fpdf2's built-in Helvetica can render it."""
+    if s is None:
+        return ""
+    if not isinstance(s, str):
+        s = str(s)
+    return s.encode("latin-1", "replace").decode("latin-1")
+
+
 # --------------------------------------------------------------------------
 # Backend registry
 # --------------------------------------------------------------------------
 
 class BackendRegistry:
-    """Detects which optional backends are available and how to reach ffmpeg."""
+    """Detects which optional backends are available and how to reach ffmpeg.
+
+    All checks are cheap (module-spec lookups), so it's safe to construct at
+    startup. Heavy imports only happen later, inside the conversion workers.
+    """
 
     def __init__(self) -> None:
         self.pil_available = PIL_AVAILABLE
-        self.pil_version = PIL_VERSION
+        self.pil_version = _pkg_version("Pillow") if PIL_AVAILABLE else None
         self.heic_supported = HEIC_SUPPORTED
         self.avif_supported = AVIF_SUPPORTED
         self.pdf_available = PDF_AVAILABLE
         self.pdf_backend = "pymupdf" if PYMUPDF_AVAILABLE else ("pypdfium2" if PYPDFIUM2_AVAILABLE else None)
+        self.pdf_writer_available = FPDF2_AVAILABLE
+        self.docx_available = DOCX_AVAILABLE
+        self.openpyxl_available = OPENPYXL_AVAILABLE
+        self.pptx_available = PPTX_AVAILABLE
+        self.odf_available = ODFPY_AVAILABLE
         self.ffmpeg_path: Optional[str] = self._resolve_ffmpeg()
         self.ffmpeg_available = self.ffmpeg_path is not None
 
@@ -359,6 +382,7 @@ class BackendRegistry:
     def _resolve_ffmpeg() -> Optional[str]:
         if IMAGEIO_FFMPEG_AVAILABLE:
             try:
+                import imageio_ffmpeg  # local, fast
                 path = imageio_ffmpeg.get_ffmpeg_exe()
                 if path and Path(path).exists():
                     return path
@@ -376,7 +400,17 @@ class BackendRegistry:
         if not self.ffmpeg_available:
             msgs.append("Audio/Video: pip install imageio-ffmpeg  (or install system ffmpeg)")
         if not self.pdf_available:
-            msgs.append("PDF: pip install pymupdf   (or: pip install pypdfium2)")
+            msgs.append("PDF reading: pip install pymupdf   (or: pip install pypdfium2)")
+        if not self.pdf_writer_available:
+            msgs.append("Document/Spreadsheet/Presentation → PDF: pip install fpdf2")
+        if not self.docx_available:
+            msgs.append("Word (.docx) reading/writing: pip install python-docx")
+        if not self.openpyxl_available:
+            msgs.append("Excel (.xlsx) reading/writing: pip install openpyxl")
+        if not self.pptx_available:
+            msgs.append("PowerPoint (.pptx) reading/writing: pip install python-pptx")
+        if not self.odf_available:
+            msgs.append("OpenDocument (odt/ods/odp): pip install odfpy")
         if self.pil_available and not self.heic_supported:
             msgs.append("HEIC images: pip install pillow-heif")
         if self.pil_available and not self.avif_supported:
@@ -391,6 +425,13 @@ class BackendRegistry:
         lines.append(f"    AVIF support:  {'yes' if self.avif_supported else 'no'}")
         lines.append(f"  FFmpeg:        {'OK (' + self.ffmpeg_path + ')' if self.ffmpeg_available else 'MISSING'}")
         lines.append(f"  PDF backend:   {self.pdf_backend or 'MISSING'}")
+        lines.append(f"  PDF writer:    {'fpdf2' if self.pdf_writer_available else 'MISSING'}")
+        lines.append(
+            f"  Office:        docx={'y' if self.docx_available else 'n'} "
+            f"xlsx={'y' if self.openpyxl_available else 'n'} "
+            f"pptx={'y' if self.pptx_available else 'n'} "
+            f"odf={'y' if self.odf_available else 'n'}"
+        )
         return lines
 
 
@@ -405,17 +446,17 @@ class ConversionJob:
     target_ext: str
     output_dir: Path
     options: dict = field(default_factory=dict)
-    status: str = "Queued"          # Queued, Converting, Done, Failed, Cancelled
-    progress: int = 0               # 0-100
+    status: str = "Queued"
+    progress: int = 0
     error: str = ""
     output_path: Optional[Path] = None
 
 
 class JobSignals(QObject):
-    progress = Signal(int, int)          # job_id, percent
-    status_changed = Signal(int, str)    # job_id, status text
-    log = Signal(str, str)               # level, message
-    finished = Signal(int, bool, str, str)  # job_id, success, message, output_path
+    progress = Signal(int, int)
+    status_changed = Signal(int, str)
+    log = Signal(str, str)
+    finished = Signal(int, bool, str, str)
 
 
 class CancelToken:
@@ -431,13 +472,13 @@ class CancelToken:
 
 
 # --------------------------------------------------------------------------
-# Conversion backends (pure functions, run inside worker threads)
+# Image conversion backend
 # --------------------------------------------------------------------------
 
 def convert_image(job: ConversionJob, signals: JobSignals, token: CancelToken) -> Path:
-    """Convert an image (or images->pdf single-file case is handled elsewhere)."""
     if not PIL_AVAILABLE:
         raise RuntimeError("Pillow is not installed. Run: pip install Pillow")
+    from PIL import Image, ImageOps, ImageSequence  # noqa: F401  (local import)
 
     src = job.source_path
     target_ext = job.target_ext.lower()
@@ -487,7 +528,6 @@ def convert_image(job: ConversionJob, signals: JobSignals, token: CancelToken) -
         save_kwargs = {"quality": opts.get("jpeg_quality", 90), "method": 2}
         im.save(out_path, "WEBP", **save_kwargs)
     else:
-        # png, bmp, ppm, tga, etc.
         fmt_map = {"ppm": "PPM", "tga": "TGA", "bmp": "BMP", "png": "PNG"}
         fmt = fmt_map.get(target_ext, target_ext.upper())
         save_kwargs = {}
@@ -504,16 +544,9 @@ def convert_image(job: ConversionJob, signals: JobSignals, token: CancelToken) -
     return out_path
 
 
-def _save_as_ico(im: "Image.Image", out_path: Path) -> None:
-    """Save a proper multi-resolution .ico: composite onto square canvas, keep aspect, upscale small sources.
-
-    Pillow's ICO writer only *downscales* the base image it is given for each
-    requested size - it will not upscale. So for small sources we must
-    upscale the square canvas to the largest requested size ourselves before
-    handing it to Pillow, otherwise Pillow silently emits an empty/invalid
-    ICO file for any requested size larger than the source.
-    """
-    if im.mode not in ("RGBA",):
+def _save_as_ico(im, out_path: Path) -> None:
+    from PIL import Image
+    if im.mode != "RGBA":
         im = im.convert("RGBA")
 
     w, h = im.size
@@ -533,7 +566,7 @@ def _save_as_ico(im: "Image.Image", out_path: Path) -> None:
 def images_to_pdf(paths: list[Path], out_path: Path, options: dict) -> Path:
     if not PIL_AVAILABLE:
         raise RuntimeError("Pillow is not installed. Run: pip install Pillow")
-    page_size = options.get("page_size", "auto")
+    from PIL import Image
     orientation = options.get("orientation", "auto")
 
     imgs = []
@@ -555,6 +588,10 @@ def images_to_pdf(paths: list[Path], out_path: Path, options: dict) -> Path:
     return out_path
 
 
+# --------------------------------------------------------------------------
+# Media conversion backend
+# --------------------------------------------------------------------------
+
 def _ffmpeg_duration_seconds(ffmpeg_path: str, src: Path) -> Optional[float]:
     try:
         proc = subprocess.run(
@@ -573,7 +610,6 @@ def _ffmpeg_duration_seconds(ffmpeg_path: str, src: Path) -> Optional[float]:
 
 def convert_media(job: ConversionJob, signals: JobSignals, token: CancelToken,
                    ffmpeg_path: str, proc_registry: dict) -> Path:
-    """Convert audio or video via FFmpeg with progress parsing and cancellation support."""
     src = job.source_path
     target_ext = job.target_ext.lower()
     opts = job.options
@@ -609,7 +645,6 @@ def convert_media(job: ConversionJob, signals: JobSignals, token: CancelToken,
         if opts.get("audio_bitrate"):
             cmd += ["-b:a", opts["audio_bitrate"]]
     else:
-        # audio
         codec_hint = FFMPEG_CONTAINER_CODEC_HINTS.get(target_ext)
         if codec_hint:
             cmd += codec_hint
@@ -689,6 +724,10 @@ def _terminate_process(proc: subprocess.Popen) -> None:
         pass
 
 
+# --------------------------------------------------------------------------
+# PDF -> image backend
+# --------------------------------------------------------------------------
+
 def pdf_to_images(job: ConversionJob, signals: JobSignals, token: CancelToken) -> list[Path]:
     src = job.source_path
     target_ext = job.target_ext.lower()
@@ -701,6 +740,8 @@ def pdf_to_images(job: ConversionJob, signals: JobSignals, token: CancelToken) -
     outputs: list[Path] = []
 
     if PYMUPDF_AVAILABLE:
+        import pymupdf
+        from PIL import Image  # for ico case
         doc = pymupdf.open(str(src))
         if doc.needs_pass:
             if not password or not doc.authenticate(password):
@@ -731,6 +772,7 @@ def pdf_to_images(job: ConversionJob, signals: JobSignals, token: CancelToken) -
         doc.close()
 
     elif PYPDFIUM2_AVAILABLE:
+        import pypdfium2 as pdfium
         try:
             pdf = pdfium.PdfDocument(str(src), password=password or None)
         except Exception as e:
@@ -766,6 +808,465 @@ def pdf_to_images(job: ConversionJob, signals: JobSignals, token: CancelToken) -
     return outputs
 
 
+# ==========================================================================
+# Office / Document backends (pure Python)
+# ==========================================================================
+
+# ----------------------------------------------------------------------
+# Shared helpers
+# ----------------------------------------------------------------------
+
+def _output_path_for(src: Path, out_dir: Path, target_ext: str) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_name = sanitize_filename(src.stem) + f".{target_ext}"
+    return unique_path(out_dir / out_name)
+
+
+def _require(cond: bool, msg: str) -> None:
+    if not cond:
+        raise RuntimeError(msg)
+
+
+# ----------------------------------------------------------------------
+# PDF writer (fpdf2)
+# ----------------------------------------------------------------------
+
+def _make_pdf():
+    from fpdf import FPDF
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.set_margins(15, 15, 15)
+    return pdf
+
+
+def _pdf_write_paragraphs(paras: list[str], out_path: Path, title: str = "") -> None:
+    _require(FPDF2_AVAILABLE, "PDF writer not installed. Run: pip install fpdf2")
+    pdf = _make_pdf()
+    pdf.add_page()
+    if title:
+        pdf.set_font("Helvetica", "B", 15)
+        pdf.multi_cell(0, 9, _latin1(title))
+        pdf.ln(2)
+    pdf.set_font("Helvetica", size=11)
+    for p in paras:
+        text = _latin1(p) if p else ""
+        if not text.strip():
+            pdf.ln(3)
+            continue
+        pdf.multi_cell(0, 6, text)
+    pdf.output(str(out_path))
+
+
+def _pdf_write_sheets(sheets: dict[str, list[list]], out_path: Path) -> None:
+    _require(FPDF2_AVAILABLE, "PDF writer not installed. Run: pip install fpdf2")
+    pdf = FPDF(orientation="L")
+    pdf.set_auto_page_break(auto=True, margin=10)
+    pdf.set_margins(10, 10, 10)
+    for name, rows in sheets.items():
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.multi_cell(0, 8, _latin1(name))
+        pdf.ln(2)
+        pdf.set_font("Courier", size=8)
+        for row in rows[:2000]:
+            line = " | ".join(_latin1(c)[:32] for c in row)
+            if not line.strip():
+                pdf.ln(3)
+                continue
+            try:
+                pdf.multi_cell(0, 4.5, line)
+            except Exception:
+                pass
+    pdf.output(str(out_path))
+
+
+def _pdf_write_slides(slides: list[list[str]], out_path: Path) -> None:
+    _require(FPDF2_AVAILABLE, "PDF writer not installed. Run: pip install fpdf2")
+    pdf = _make_pdf()
+    for i, slide in enumerate(slides, 1):
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 18)
+        pdf.multi_cell(0, 11, f"Slide {i}")
+        pdf.ln(3)
+        pdf.set_font("Helvetica", size=12)
+        for line in slide:
+            pdf.multi_cell(0, 7, _latin1(line))
+    pdf.output(str(out_path))
+
+
+# ----------------------------------------------------------------------
+# Document (Word-like) read / write
+# ----------------------------------------------------------------------
+
+def _read_document_paragraphs(path: Path) -> list[str]:
+    ext = path.suffix.lstrip(".").lower()
+
+    if ext in ("txt", "md"):
+        return path.read_text(encoding="utf-8", errors="replace").split("\n")
+
+    if ext == "docx":
+        _require(DOCX_AVAILABLE, "python-docx is not installed. Run: pip install python-docx")
+        import docx
+        d = docx.Document(str(path))
+        out: list[str] = []
+        for p in d.paragraphs:
+            out.append(p.text)
+        for tbl in d.tables:
+            for row in tbl.rows:
+                out.append(" | ".join(c.text for c in row.cells))
+        return out
+
+    if ext == "odt":
+        _require(ODFPY_AVAILABLE, "odfpy is not installed. Run: pip install odfpy")
+        from odf.opendocument import load
+        from odf.text import P
+        from odf import teletype
+        doc = load(str(path))
+        out = []
+        for p in doc.getElementsByType(P):
+            out.append(teletype.extractText(p))
+        return out
+
+    raise RuntimeError(f"Unsupported document input: .{ext}")
+
+
+def _write_document(paras: list[str], out_path: Path, target_ext: str, title: str = "") -> None:
+    target_ext = target_ext.lower()
+
+    if target_ext == "txt":
+        out_path.write_text("\n".join(paras), encoding="utf-8")
+        return
+
+    if target_ext == "md":
+        out_path.write_text("\n\n".join(paras), encoding="utf-8")
+        return
+
+    if target_ext == "html":
+        import html as _html
+        body = "\n".join(f"<p>{_html.escape(p)}</p>" for p in paras)
+        t = _html.escape(title or out_path.stem)
+        out_path.write_text(
+            f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>{t}</title></head>"
+            f"<body>{body}</body></html>",
+            encoding="utf-8",
+        )
+        return
+
+    if target_ext == "pdf":
+        _pdf_write_paragraphs(paras, out_path, title=title)
+        return
+
+    if target_ext == "odt":
+        _require(ODFPY_AVAILABLE, "odfpy is not installed. Run: pip install odfpy")
+        from odf.opendocument import OpenDocumentText
+        from odf.text import P
+        doc = OpenDocumentText()
+        for p in paras:
+            doc.text.addElement(P(text=p or ""))
+        doc.save(str(out_path))
+        return
+
+    if target_ext == "docx":
+        _require(DOCX_AVAILABLE, "python-docx is not installed. Run: pip install python-docx")
+        import docx
+        d = docx.Document()
+        for p in paras:
+            d.add_paragraph(p or "")
+        d.save(str(out_path))
+        return
+
+    raise RuntimeError(f"Unsupported document output: .{target_ext}")
+
+
+def convert_document(job: ConversionJob, signals: JobSignals, token: CancelToken) -> Path:
+    src = job.source_path
+    target_ext = job.target_ext.lower()
+    out_path = _output_path_for(src, job.output_dir, target_ext)
+
+    signals.progress.emit(job.job_id, 15)
+    paras = _read_document_paragraphs(src)
+    if token.cancelled:
+        raise InterruptedError("Cancelled by user")
+    signals.progress.emit(job.job_id, 60)
+    _write_document(paras, out_path, target_ext, title=src.stem)
+    signals.progress.emit(job.job_id, 100)
+    return out_path
+
+
+# ----------------------------------------------------------------------
+# Spreadsheet read / write
+# ----------------------------------------------------------------------
+
+def _read_spreadsheet(path: Path) -> dict[str, list[list]]:
+    ext = path.suffix.lstrip(".").lower()
+
+    if ext in ("csv", "tsv"):
+        import csv
+        delim = "\t" if ext == "tsv" else ","
+        with path.open("r", encoding="utf-8", errors="replace", newline="") as f:
+            reader = csv.reader(f, delimiter=delim)
+            rows = [list(r) for r in reader]
+        return {path.stem: rows}
+
+    if ext == "xlsx":
+        _require(OPENPYXL_AVAILABLE, "openpyxl is not installed. Run: pip install openpyxl")
+        import openpyxl
+        wb = openpyxl.load_workbook(str(path), data_only=True, read_only=True)
+        out: dict[str, list[list]] = {}
+        for ws in wb.worksheets:
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                rows.append(["" if v is None else v for v in row])
+            out[ws.title] = rows
+        wb.close()
+        return out
+
+    if ext == "ods":
+        _require(ODFPY_AVAILABLE, "odfpy is not installed. Run: pip install odfpy")
+        from odf.opendocument import load
+        from odf.table import Table, TableRow, TableCell
+        from odf import teletype
+        doc = load(str(path))
+        out = {}
+        for tbl in doc.getElementsByType(Table):
+            name = tbl.getAttribute("name") or "Sheet"
+            rows = []
+            for tr in tbl.getElementsByType(TableRow):
+                cells: list[str] = []
+                for tc in tr.getElementsByType(TableCell):
+                    try:
+                        rep = int(tc.getAttribute("numbercolumnsrepeated") or 1)
+                    except Exception:
+                        rep = 1
+                    txt = teletype.extractText(tc)
+                    for _ in range(rep):
+                        cells.append(txt)
+                rows.append(cells)
+            out[name] = rows
+        return out
+
+    raise RuntimeError(f"Unsupported spreadsheet input: .{ext}")
+
+
+def _write_spreadsheet(sheets: dict[str, list[list]], out_path: Path, target_ext: str) -> None:
+    import csv as _csv
+    import json as _json
+    import html as _html
+    target_ext = target_ext.lower()
+
+    if target_ext in ("csv", "tsv"):
+        # Only the first sheet is written (one file per conversion).
+        name = next(iter(sheets))
+        rows = sheets[name]
+        delim = "\t" if target_ext == "tsv" else ","
+        with out_path.open("w", encoding="utf-8", newline="") as f:
+            w = _csv.writer(f, delimiter=delim)
+            for r in rows:
+                w.writerow(["" if v is None else v for v in r])
+        return
+
+    if target_ext == "json":
+        out_path.write_text(json.dumps(sheets, indent=2, default=str), encoding="utf-8")
+        return
+
+    if target_ext == "html":
+        parts = ["<!DOCTYPE html><html><head><meta charset='utf-8'><style>"
+                 "table{border-collapse:collapse}td,th{border:1px solid #888;padding:2px 6px;font-family:sans-serif;font-size:12px}"
+                 "</style></head><body>"]
+        for name, rows in sheets.items():
+            parts.append(f"<h2>{_html.escape(str(name))}</h2><table>")
+            for r in rows:
+                parts.append("<tr>" + "".join(f"<td>{_html.escape(str(v))}</td>" for v in r) + "</tr>")
+            parts.append("</table>")
+        parts.append("</body></html>")
+        out_path.write_text("\n".join(parts), encoding="utf-8")
+        return
+
+    if target_ext == "pdf":
+        _pdf_write_sheets(sheets, out_path)
+        return
+
+    if target_ext == "ods":
+        _require(ODFPY_AVAILABLE, "odfpy is not installed. Run: pip install odfpy")
+        from odf.opendocument import OpenDocumentSpreadsheet
+        from odf.table import Table, TableRow, TableCell
+        from odf.text import P
+        doc = OpenDocumentSpreadsheet()
+        for name, rows in sheets.items():
+            t = Table(name=str(name))
+            for row in rows:
+                tr = TableRow()
+                for val in row:
+                    tc = TableCell()
+                    tc.addElement(P(text="" if val is None else str(val)))
+                    tr.addElement(tc)
+                t.addElement(tr)
+            doc.spreadsheet.addElement(t)
+        doc.save(str(out_path))
+        return
+
+    if target_ext == "xlsx":
+        _require(OPENPYXL_AVAILABLE, "openpyxl is not installed. Run: pip install openpyxl")
+        import openpyxl
+        wb = openpyxl.Workbook()
+        # Remove the default sheet; we'll add our own.
+        default = wb.active
+        wb.remove(default)
+        for name, rows in sheets.items():
+            ws = wb.create_sheet(title=str(name)[:31] or "Sheet")
+            for r in rows:
+                ws.append(list(r))
+        if not wb.worksheets:
+            wb.create_sheet(title="Sheet")
+        wb.save(str(out_path))
+        return
+
+    raise RuntimeError(f"Unsupported spreadsheet output: .{target_ext}")
+
+
+def convert_spreadsheet(job: ConversionJob, signals: JobSignals, token: CancelToken) -> Path:
+    src = job.source_path
+    target_ext = job.target_ext.lower()
+    out_path = _output_path_for(src, job.output_dir, target_ext)
+
+    signals.progress.emit(job.job_id, 15)
+    sheets = _read_spreadsheet(src)
+    if token.cancelled:
+        raise InterruptedError("Cancelled by user")
+    signals.progress.emit(job.job_id, 60)
+    _write_spreadsheet(sheets, out_path, target_ext)
+    signals.progress.emit(job.job_id, 100)
+    return out_path
+
+
+# ----------------------------------------------------------------------
+# Presentation read / write
+# ----------------------------------------------------------------------
+
+def _read_presentation_slides(path: Path) -> list[list[str]]:
+    ext = path.suffix.lstrip(".").lower()
+
+    if ext == "pptx":
+        _require(PPTX_AVAILABLE, "python-pptx is not installed. Run: pip install python-pptx")
+        from pptx import Presentation
+        prs = Presentation(str(path))
+        slides: list[list[str]] = []
+        for slide in prs.slides:
+            lines: list[str] = []
+            for shape in slide.shapes:
+                if getattr(shape, "has_text_frame", False):
+                    for p in shape.text_frame.paragraphs:
+                        txt = "".join(r.text for r in p.runs) or p.text
+                        if txt:
+                            lines.append(txt)
+            slides.append(lines)
+        return slides
+
+    if ext == "odp":
+        _require(ODFPY_AVAILABLE, "odfpy is not installed. Run: pip install odfpy")
+        from odf.opendocument import load
+        from odf.draw import Page
+        from odf.text import P
+        from odf import teletype
+        doc = load(str(path))
+        slides = []
+        for page in doc.getElementsByType(Page):
+            lines = []
+            for p in page.getElementsByType(P):
+                t = teletype.extractText(p)
+                if t:
+                    lines.append(t)
+            slides.append(lines)
+        return slides
+
+    raise RuntimeError(f"Unsupported presentation input: .{ext}")
+
+
+def _write_presentation(slides: list[list[str]], out_path: Path, target_ext: str, title: str = "") -> None:
+    import html as _html
+    target_ext = target_ext.lower()
+
+    if target_ext == "txt":
+        lines: list[str] = []
+        for i, s in enumerate(slides, 1):
+            lines.append(f"--- Slide {i} ---")
+            lines.extend(s)
+            lines.append("")
+        out_path.write_text("\n".join(lines), encoding="utf-8")
+        return
+
+    if target_ext == "html":
+        t = _html.escape(title or out_path.stem)
+        parts = [f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>{t}</title>"
+                 "<style>section{margin:1em 0;padding:1em;border:1px solid #ccc}</style>"
+                 "</head><body>"]
+        for i, s in enumerate(slides, 1):
+            parts.append(f"<section><h2>Slide {i}</h2>")
+            for line in s:
+                parts.append(f"<p>{_html.escape(line)}</p>")
+            parts.append("</section>")
+        parts.append("</body></html>")
+        out_path.write_text("\n".join(parts), encoding="utf-8")
+        return
+
+    if target_ext == "pdf":
+        _pdf_write_slides(slides, out_path)
+        return
+
+    if target_ext == "pptx":
+        _require(PPTX_AVAILABLE, "python-pptx is not installed. Run: pip install python-pptx")
+        from pptx import Presentation
+        from pptx.util import Inches
+        prs = Presentation()
+        blank = prs.slide_layouts[6]
+        for i, s in enumerate(slides, 1):
+            slide = prs.slides.add_slide(blank)
+            tb = slide.shapes.add_textbox(Inches(0.5), Inches(0.5), Inches(9), Inches(6))
+            tf = tb.text_frame
+            tf.text = f"Slide {i}"
+            for line in s:
+                p = tf.add_paragraph()
+                p.text = line
+        prs.save(str(out_path))
+        return
+
+    if target_ext == "odp":
+        _require(ODFPY_AVAILABLE, "odfpy is not installed. Run: pip install odfpy")
+        from odf.opendocument import OpenDocumentPresentation
+        from odf.draw import Page, Frame, TextBox
+        from odf.text import P
+        doc = OpenDocumentPresentation()
+        for i, s in enumerate(slides, 1):
+            page = Page(name=f"Slide{i}", masterpagename="Standard")
+            frame = Frame(width="25cm", height="18cm", x="1cm", y="1cm")
+            tb = TextBox()
+            tb.addElement(P(text=f"Slide {i}"))
+            for line in s:
+                tb.addElement(P(text=line))
+            frame.addElement(tb)
+            page.addElement(frame)
+            doc.presentation.addElement(page)
+        doc.save(str(out_path))
+        return
+
+    raise RuntimeError(f"Unsupported presentation output: .{target_ext}")
+
+
+def convert_presentation(job: ConversionJob, signals: JobSignals, token: CancelToken) -> Path:
+    src = job.source_path
+    target_ext = job.target_ext.lower()
+    out_path = _output_path_for(src, job.output_dir, target_ext)
+
+    signals.progress.emit(job.job_id, 15)
+    slides = _read_presentation_slides(src)
+    if token.cancelled:
+        raise InterruptedError("Cancelled by user")
+    signals.progress.emit(job.job_id, 60)
+    _write_presentation(slides, out_path, target_ext, title=src.stem)
+    signals.progress.emit(job.job_id, 100)
+    return out_path
+
+
 # --------------------------------------------------------------------------
 # Worker (runs in QThreadPool)
 # --------------------------------------------------------------------------
@@ -797,12 +1298,19 @@ class ConversionWorker(QRunnable):
             elif cat in ("audio", "video"):
                 if not self.backends.ffmpeg_available:
                     raise RuntimeError("FFmpeg not available. Run: pip install imageio-ffmpeg")
-                out_path = convert_media(job, self.signals, self.token, self.backends.ffmpeg_path, self.proc_registry)
+                out_path = convert_media(job, self.signals, self.token,
+                                         self.backends.ffmpeg_path, self.proc_registry)
             elif cat == "pdf":
                 if not self.backends.pdf_available:
                     raise RuntimeError("No PDF backend installed. Run: pip install pymupdf")
                 results = pdf_to_images(job, self.signals, self.token)
                 out_path = results[0] if results else None
+            elif cat == "document":
+                out_path = convert_document(job, self.signals, self.token)
+            elif cat == "spreadsheet":
+                out_path = convert_spreadsheet(job, self.signals, self.token)
+            elif cat == "presentation":
+                out_path = convert_presentation(job, self.signals, self.token)
             else:
                 raise RuntimeError(f"Unsupported source type: {job.source_path.suffix}")
 
@@ -820,6 +1328,34 @@ class ConversionWorker(QRunnable):
             self.signals.log.emit("ERROR", f"{job.source_path.name}: {e}\n{tb}")
             self.signals.status_changed.emit(job.job_id, "Failed")
             self.signals.finished.emit(job.job_id, False, str(e), "")
+
+
+# --------------------------------------------------------------------------
+# Default options (used when the Options dialog has not been opened yet)
+# --------------------------------------------------------------------------
+
+def default_options() -> dict:
+    return {
+        "preserve_metadata": True,
+        "overwrite": False,
+        "jpeg_quality": 90,
+        "fast_png": True,
+        "page_size": "auto",
+        "orientation": "auto",
+        "one_pdf_per_image": False,
+        "bitrate": "Auto",
+        "sample_rate": "Auto",
+        "channels": "Auto",
+        "video_preset": "veryfast",
+        "resolution": "Source",
+        "crf": 23,
+        "fps": "Source",
+        "gif_fps": 10,
+        "gif_width": 480,
+        "dpi": 150,
+        "page_range": "all",
+        "password": "",
+    }
 
 
 # --------------------------------------------------------------------------
@@ -845,7 +1381,7 @@ class DropZone(QFrame):
         self.text_label = QLabel("Drag & drop files or folders here")
         self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.text_label.setObjectName("DropText")
-        self.sub_label = QLabel("Images, audio, video, and PDF files are supported")
+        self.sub_label = QLabel("Images, audio, video, PDF, and Office documents")
         self.sub_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sub_label.setObjectName("DropSubText")
         layout.addWidget(self.icon_label)
@@ -893,7 +1429,7 @@ class DropZone(QFrame):
 
 
 # --------------------------------------------------------------------------
-# UI: Options panel (context sensitive)
+# UI: Options dialog
 # --------------------------------------------------------------------------
 
 class OptionsDialog(QDialog):
@@ -911,7 +1447,7 @@ class OptionsDialog(QDialog):
 
         self.tabs = QTabWidget(self)
 
-        # Common options tab
+        # -- General --
         general_tab = QWidget()
         gen_layout = QVBoxLayout(general_tab)
         common_box = QGroupBox("General")
@@ -926,7 +1462,7 @@ class OptionsDialog(QDialog):
         gen_layout.addStretch(1)
         self.tabs.addTab(general_tab, "General")
 
-        # Image page
+        # -- Image --
         self.image_page = QWidget()
         img_layout = QVBoxLayout(self.image_page)
         img_box = QGroupBox("Image Output")
@@ -950,7 +1486,7 @@ class OptionsDialog(QDialog):
         img_layout.addStretch(1)
         self.tabs.addTab(self.image_page, "Image")
 
-        # Audio page
+        # -- Audio --
         self.audio_page = QWidget()
         aud_layout = QVBoxLayout(self.audio_page)
         aud_box = QGroupBox("Audio Encoding")
@@ -968,7 +1504,7 @@ class OptionsDialog(QDialog):
         aud_layout.addStretch(1)
         self.tabs.addTab(self.audio_page, "Audio")
 
-        # Video page
+        # -- Video --
         self.video_page = QWidget()
         vid_layout = QVBoxLayout(self.video_page)
         vid_box = QGroupBox("Video Encoding")
@@ -999,7 +1535,7 @@ class OptionsDialog(QDialog):
         vid_layout.addStretch(1)
         self.tabs.addTab(self.video_page, "Video")
 
-        # PDF page
+        # -- PDF --
         self.pdf_page = QWidget()
         pdf_layout = QVBoxLayout(self.pdf_page)
         pdf_box = QGroupBox("PDF Conversion")
@@ -1033,24 +1569,25 @@ class OptionsDialog(QDialog):
         outer.addLayout(btn_row)
 
     def _reset_defaults(self) -> None:
-        self.preserve_metadata_cb.setChecked(True)
-        self.overwrite_cb.setChecked(False)
-        self.jpeg_quality_spin.setValue(90)
-        self.fast_png_cb.setChecked(True)
-        self.page_size_combo.setCurrentText("Auto")
-        self.orientation_combo.setCurrentText("Auto")
-        self.one_pdf_per_image_cb.setChecked(False)
-        self.audio_bitrate_combo.setCurrentText("Auto")
-        self.sample_rate_combo.setCurrentText("Auto")
-        self.channels_combo.setCurrentText("Auto")
-        self.video_preset_combo.setCurrentText("veryfast")
-        self.resolution_combo.setCurrentText("Source")
-        self.crf_spin.setValue(23)
-        self.fps_combo.setCurrentText("Source")
-        self.gif_fps_spin.setValue(10)
-        self.gif_width_spin.setValue(480)
-        self.dpi_spin.setValue(150)
-        self.page_range_edit.setText("all")
+        d = default_options()
+        self.preserve_metadata_cb.setChecked(d["preserve_metadata"])
+        self.overwrite_cb.setChecked(d["overwrite"])
+        self.jpeg_quality_spin.setValue(d["jpeg_quality"])
+        self.fast_png_cb.setChecked(d["fast_png"])
+        self.page_size_combo.setCurrentText(d["page_size"].capitalize())
+        self.orientation_combo.setCurrentText(d["orientation"].capitalize())
+        self.one_pdf_per_image_cb.setChecked(d["one_pdf_per_image"])
+        self.audio_bitrate_combo.setCurrentText(d["bitrate"])
+        self.sample_rate_combo.setCurrentText(d["sample_rate"])
+        self.channels_combo.setCurrentText(d["channels"])
+        self.video_preset_combo.setCurrentText(d["video_preset"])
+        self.resolution_combo.setCurrentText(d["resolution"])
+        self.crf_spin.setValue(d["crf"])
+        self.fps_combo.setCurrentText(d["fps"])
+        self.gif_fps_spin.setValue(d["gif_fps"])
+        self.gif_width_spin.setValue(d["gif_width"])
+        self.dpi_spin.setValue(d["dpi"])
+        self.page_range_edit.setText(d["page_range"])
         self.pdf_password_edit.clear()
 
     def show_for_category(self, category: str) -> None:
@@ -1083,9 +1620,6 @@ class OptionsDialog(QDialog):
         }
 
 
-OptionsPanel = OptionsDialog
-
-
 # --------------------------------------------------------------------------
 # UI: File table
 # --------------------------------------------------------------------------
@@ -1094,10 +1628,10 @@ COL_NAME, COL_TYPE, COL_SIZE, COL_FORMAT, COL_STATUS, COL_PROGRESS, COL_REMOVE =
 
 
 class FileTable(QTableWidget):
-    remove_requested = Signal(int)          # row
+    remove_requested = Signal(int)
     remove_all_requested = Signal()
-    open_folder_requested = Signal(int)     # row
-    target_format_changed = Signal(int, str)  # row, new ext
+    open_folder_requested = Signal(int)
+    target_format_changed = Signal(int, str)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(0, 7, parent)
@@ -1107,7 +1641,7 @@ class FileTable(QTableWidget):
         header = self.horizontalHeader()
         header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(COL_TYPE, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(COL_TYPE, 75)
+        header.resizeSection(COL_TYPE, 90)
         header.setSectionResizeMode(COL_SIZE, QHeaderView.ResizeMode.Fixed)
         header.resizeSection(COL_SIZE, 80)
         header.setSectionResizeMode(COL_FORMAT, QHeaderView.ResizeMode.Fixed)
@@ -1317,6 +1851,7 @@ QSplitter::handle:hover { background-color: #4C8DFF; }
 #LeftPane, #RightPane { background-color: #1e1f22; }
 """
 
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1329,15 +1864,15 @@ class MainWindow(QMainWindow):
         self.cancel_token = CancelToken()
         self.proc_registry: dict[int, subprocess.Popen] = {}
         self.thread_pool = QThreadPool.globalInstance()
-        # QThreadPool only takes ownership of the C++ side of a QRunnable; without
-        # an explicit Python reference here, the worker (and the QObject signals
-        # it owns) can be garbage-collected while still running on a worker
-        # thread, corrupting or crashing an in-flight conversion.
         self._active_workers: dict[int, tuple["ConversionWorker", JobSignals]] = {}
         self._active_jobs = 0
         self._total_jobs_in_batch = 0
         self._completed_jobs_in_batch = 0
         self._converting = False
+        self._per_job_progress: dict[int, int] = {}
+
+        # Lazily-created Options dialog (heavy to build).
+        self.options_dialog: Optional[OptionsDialog] = None
 
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(900, 600)
@@ -1345,8 +1880,10 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._restore_settings()
-        self._log_startup_report()
-        self._apply_backend_banners()
+
+        # Defer diagnostics to after the window paints so startup feels snappy.
+        QTimer.singleShot(0, self._log_startup_report)
+        QTimer.singleShot(0, self._apply_backend_banners)
 
     # ---------------- UI construction ----------------
 
@@ -1357,7 +1894,6 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(14, 10, 14, 10)
         root.setSpacing(10)
 
-        # Banner area for missing backends (full width, above the panes)
         self.banner_label = QLabel()
         self.banner_label.setWordWrap(True)
         self.banner_label.setStyleSheet(
@@ -1378,7 +1914,6 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([360, 840])
 
-        # Status bar
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Ready")
 
@@ -1415,7 +1950,7 @@ class MainWindow(QMainWindow):
         browse_row.addWidget(self.browse_folder_btn)
         layout.addLayout(browse_row)
 
-        # -- Convert Selected To (Moved to Left Pane) --
+        # -- Convert Selected To --
         layout.addWidget(self._section_label("CONVERT SELECTED TO"))
         self.bulk_format_combo = QComboBox()
         self.bulk_format_combo.setMinimumHeight(32)
@@ -1441,10 +1976,8 @@ class MainWindow(QMainWindow):
         output_form.addLayout(out_btn_row)
         layout.addWidget(output_group)
 
-        # -- Options --
+        # -- Options (lazy dialog) --
         layout.addWidget(self._section_label("OPTIONS"))
-        self.options_dialog = OptionsDialog(self)
-        self.options_panel = self.options_dialog
         self.options_btn = QPushButton(" Conversion Options…")
         self.options_btn.setIcon(svg_icon(ICON_SETTINGS, 15))
         self.options_btn.setMinimumHeight(32)
@@ -1500,7 +2033,14 @@ class MainWindow(QMainWindow):
         return pane
 
     def _open_options_dialog(self) -> None:
+        if self.options_dialog is None:
+            self.options_dialog = OptionsDialog(self)
         self.options_dialog.exec()
+
+    def _gather_options(self) -> dict:
+        if self.options_dialog is not None:
+            return self.options_dialog.gather_options()
+        return default_options()
 
     def _build_right_pane(self) -> QWidget:
         inner = QWidget()
@@ -1640,7 +2180,6 @@ class MainWindow(QMainWindow):
         if job_id is not None:
             self.jobs.pop(job_id, None)
             self.job_rows.pop(job_id, None)
-        # Reindex row mapping after removal.
         self.job_rows = {jid: (r - 1 if r > row else r) for jid, r in self.job_rows.items()}
         self._update_convert_button_state()
 
@@ -1768,10 +2307,10 @@ class MainWindow(QMainWindow):
         self.convert_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.overall_progress.setValue(0)
-        self._per_job_progress: dict[int, int] = {j.job_id: 0 for j in pending_jobs}
+        self._per_job_progress = {j.job_id: 0 for j in pending_jobs}
         self.statusBar().showMessage("Converting…")
 
-        common_options = self.options_panel.gather_options()
+        common_options = self._gather_options()
 
         for job in pending_jobs:
             job.options.update(common_options)
