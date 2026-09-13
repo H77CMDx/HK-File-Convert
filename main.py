@@ -116,11 +116,6 @@ ODFPY_AVAILABLE = _module_available("odf")
 APP_NAME = "HK File Converter"
 ORG_NAME = "HK Software"
 
-
-# --------------------------------------------------------------------------
-# SVG icons (no emoji anywhere in the UI)
-# --------------------------------------------------------------------------
-
 _ICON_CACHE: dict[tuple[str, int], QIcon] = {}
 
 
@@ -1883,7 +1878,6 @@ class MainWindow(QMainWindow):
 
         # Defer diagnostics to after the window paints so startup feels snappy.
         QTimer.singleShot(0, self._log_startup_report)
-        QTimer.singleShot(0, self._apply_backend_banners)
 
     # ---------------- UI construction ----------------
 
@@ -1893,14 +1887,6 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(14, 10, 14, 10)
         root.setSpacing(10)
-
-        self.banner_label = QLabel()
-        self.banner_label.setWordWrap(True)
-        self.banner_label.setStyleSheet(
-            "background-color: #5a4300; color: #ffe9a8; border-radius: 8px; padding: 8px;"
-        )
-        self.banner_label.setVisible(False)
-        root.addWidget(self.banner_label)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
@@ -2095,15 +2081,8 @@ class MainWindow(QMainWindow):
     def _log_startup_report(self) -> None:
         for line in self.backends.startup_report_lines():
             self.log_panel.append("INFO", line)
-
-    def _apply_backend_banners(self) -> None:
-        missing = self.backends.missing_backends_report()
-        if missing:
-            text = "Some features are unavailable until you install extra packages:\n" + "\n".join(
-                f"  • {m}" for m in missing
-            )
-            self.banner_label.setText(text)
-            self.banner_label.setVisible(True)
+        for line in self.backends.missing_backends_report():
+            self.log_panel.append("WARN", f"Feature unavailable: {line}")
 
     # ---------------- Adding files ----------------
 
