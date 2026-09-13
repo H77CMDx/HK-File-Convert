@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-File Converter - a single-file, fully offline desktop file converter with a
-modern PySide6 GUI.
+Fully offline desktop file converter with a modern PySide6 GUI.
+Partially vibe coded : Claude Sonnet 5, GPT 5.6 Luna
 
 Supports:
     - Images  (via Pillow)
