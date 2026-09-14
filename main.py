@@ -228,6 +228,116 @@ FFMPEG_CONTAINER_CODEC_HINTS = {
     "amr": ["-c:a", "libopencore_amrnb", "-ar", "8000", "-ac", "1"],
 }
 
+# --------------------------------------------------------------------------
+# Video codec selection.
+#
+# Previously the app never set an explicit "-c:v", so ffmpeg silently fell
+# back to whatever the *default* encoder for the target container is (e.g.
+# VP9 for .webm), while still passing "-preset"/"-crf" - options that only
+# make sense for libx264/libx265 and are ignored (or rejected) by other
+# encoders. That alone made many conversions dramatically slower than
+# necessary. We now pick an explicit software codec per container, and
+# prefer a hardware encoder when one is actually available on the machine.
+# --------------------------------------------------------------------------
+
+# target_ext -> (software encoder, [hardware encoder candidates in priority order])
+FFMPEG_VIDEO_CODECS: dict[str, tuple[str, list[str]]] = {
+    "mp4": ("libx264", ["h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf"]),
+    "m4v": ("libx264", ["h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf"]),
+    "mov": ("libx264", ["h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf"]),
+    "mkv": ("libx264", ["h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf"]),
+    "ts":  ("libx264", ["h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf"]),
+    "webm": ("libvpx-vp9", []),
+    "avi": ("mpeg4", []),
+    "flv": ("flv", []),
+    "wmv": ("wmv2", []),
+    "mpg": ("mpeg2video", []),
+    "mpeg": ("mpeg2video", []),
+}
+
+# Hardware encoders keyed by the exact name ffmpeg lists in `-encoders`.
+HW_VIDEO_ENCODERS = {
+    "h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf",
+}
+
+
+def _probe_hw_video_encoders(ffmpeg_path: str) -> set[str]:
+    """Return the subset of HW_VIDEO_ENCODERS actually available in this ffmpeg build.
+
+    Just because ffmpeg was *compiled* with support for an encoder doesn't
+    mean the GPU/driver on this machine can use it, so we don't try to probe
+    further than that; convert_media() falls back to software automatically
+    if the hardware encoder fails at runtime.
+    """
+    try:
+        proc = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-encoders"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=10,
+        )
+        listed = proc.stdout or ""
+    except Exception:
+        return set()
+    return {name for name in HW_VIDEO_ENCODERS if name in listed}
+
+
+def _video_encode_args(target_ext: str, opts: dict, hw_encoders: set[str]) -> tuple[list[str], str]:
+    """Build the "-c:v ... quality/speed flags" portion of an ffmpeg command.
+
+    Returns (args, encoder_name). Speed/quality flags are encoder-specific -
+    "-preset"/"-crf" only mean something to libx264/libx265, so each codec
+    family gets its own mapping instead of blindly reusing those two flags.
+    """
+    software, hw_candidates = FFMPEG_VIDEO_CODECS.get(target_ext, ("libx264", []))
+    use_hw = opts.get("hw_accel", True)
+    crf = opts.get("crf", 23)
+    preset = opts.get("video_preset", "veryfast")
+    bitrate = opts.get("video_bitrate")
+
+    encoder = None
+    if use_hw:
+        for candidate in hw_candidates:
+            if candidate in hw_encoders:
+                encoder = candidate
+                break
+    if encoder is None:
+        encoder = software
+
+    if encoder in ("libx264", "libx265"):
+        args = ["-c:v", encoder]
+        if preset and preset != "default":
+            args += ["-preset", preset]
+        args += ["-crf", str(crf)] if bitrate is None else ["-b:v", bitrate]
+        return args, encoder
+
+    if encoder == "h264_nvenc":
+        # nvenc uses its own preset names and constant-quality mode ("-cq").
+        return ["-c:v", "h264_nvenc", "-preset", "p4" if preset != "ultrafast" else "p1",
+                "-rc", "vbr", "-cq", str(crf)], encoder
+
+    if encoder == "h264_qsv":
+        return ["-c:v", "h264_qsv", "-preset", "veryfast" if preset == "ultrafast" else "medium",
+                "-global_quality", str(crf)], encoder
+
+    if encoder == "h264_videotoolbox":
+        # VideoToolbox has no CRF; approximate it with a quality-driven bitrate.
+        return ["-c:v", "h264_videotoolbox", "-q:v", str(max(1, min(100, 100 - crf * 2)))], encoder
+
+    if encoder == "h264_amf":
+        return ["-c:v", "h264_amf", "-quality", "speed", "-rc", "cqp",
+                "-qp_i", str(crf), "-qp_p", str(crf)], encoder
+
+    if encoder == "libvpx-vp9":
+        # VP9 needs "-b:v 0" to actually honor CRF (constant-quality mode),
+        # and "-deadline"/"-cpu-used" are its real speed knobs (not -preset).
+        cpu_used = "8" if preset in ("ultrafast", "veryfast") else "4"
+        return ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", str(crf),
+                "-deadline", "good", "-cpu-used", cpu_used, "-row-mt", "1"], encoder
+
+    # Plain software codecs (mpeg4, flv1/flv, wmv2, mpeg2video): use -q:v,
+    # the generic "quality" knob these encoders actually understand.
+    return ["-c:v", encoder, "-q:v", str(max(2, min(31, crf)))], encoder
+
 
 def category_of_ext(ext: str) -> str:
     ext = ext.lower().lstrip(".")
@@ -372,6 +482,10 @@ class BackendRegistry:
         self.odf_available = ODFPY_AVAILABLE
         self.ffmpeg_path: Optional[str] = self._resolve_ffmpeg()
         self.ffmpeg_available = self.ffmpeg_path is not None
+        # Cheap one-time probe; avoids re-running "ffmpeg -encoders" per job.
+        self.hw_video_encoders: set[str] = (
+            _probe_hw_video_encoders(self.ffmpeg_path) if self.ffmpeg_available else set()
+        )
 
     @staticmethod
     def _resolve_ffmpeg() -> Optional[str]:
@@ -419,6 +533,9 @@ class BackendRegistry:
         lines.append(f"    HEIC support:  {'yes' if self.heic_supported else 'no'}")
         lines.append(f"    AVIF support:  {'yes' if self.avif_supported else 'no'}")
         lines.append(f"  FFmpeg:        {'OK (' + self.ffmpeg_path + ')' if self.ffmpeg_available else 'MISSING'}")
+        lines.append(
+            f"  HW encoders:   {', '.join(sorted(self.hw_video_encoders)) if self.hw_video_encoders else 'none detected (software encoding only)'}"
+        )
         lines.append(f"  PDF backend:   {self.pdf_backend or 'MISSING'}")
         lines.append(f"  PDF writer:    {'fpdf2' if self.pdf_writer_available else 'MISSING'}")
         lines.append(
@@ -603,105 +720,156 @@ def _ffmpeg_duration_seconds(ffmpeg_path: str, src: Path) -> Optional[float]:
     return None
 
 
+def _ffmpeg_thread_count(opts: dict) -> str:
+    # Each concurrent job used to pass "-threads 0" (= let the encoder grab
+    # every logical core it can see). With N parallel worker jobs running
+    # video encodes at once, that's N encoders all fighting over every core
+    # at the same time - the single biggest cause of "video conversion is
+    # slow" when converting more than one file. Split the machine's cores
+    # evenly across however many workers are actually configured instead.
+    workers = max(1, int(opts.get("max_workers", 1) or 1))
+    cores = os.cpu_count() or 4
+    return str(max(1, cores // workers))
+
+
 def convert_media(job: ConversionJob, signals: JobSignals, token: CancelToken,
-                   ffmpeg_path: str, proc_registry: dict) -> Path:
+                   ffmpeg_path: str, proc_registry: dict, hw_encoders: Optional[set] = None) -> Path:
     src = job.source_path
     target_ext = job.target_ext.lower()
     opts = job.options
+    hw_encoders = hw_encoders or set()
 
     out_name = sanitize_filename(src.stem) + f".{target_ext}"
     out_path = unique_path(job.output_dir / out_name)
     job.output_dir.mkdir(parents=True, exist_ok=True)
 
     duration = _ffmpeg_duration_seconds(ffmpeg_path, src)
-
-    cmd = [ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-threads", "0", "-i", str(src)]
+    threads = _ffmpeg_thread_count(opts)
 
     is_gif_target = target_ext == "gif"
     is_video_source = category_of_ext(src.suffix) == "video"
+    is_video_job = category_of_ext(src.suffix) == "video" or category_of_ext(f".{target_ext}") == "video"
 
-    if is_gif_target and is_video_source:
-        fps = opts.get("gif_fps", 10)
-        width = opts.get("gif_width", 480)
-        vf = f"fps={fps},scale={width}:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
-        cmd += ["-vf", vf, "-loop", "0"]
-    elif category_of_ext(src.suffix) == "video" or category_of_ext(f".{target_ext}") == "video":
-        preset = opts.get("video_preset", "veryfast")
-        if preset and preset != "default":
-            cmd += ["-preset", preset]
-        if opts.get("resolution") and opts["resolution"] != "Source":
-            cmd += ["-vf", f"scale={opts['resolution']}"]
-        if opts.get("fps") and opts["fps"] != "Source":
-            cmd += ["-r", str(opts["fps"])]
-        if opts.get("crf") is not None:
-            cmd += ["-crf", str(opts["crf"])]
-        elif opts.get("video_bitrate"):
-            cmd += ["-b:v", opts["video_bitrate"]]
-        if opts.get("audio_bitrate"):
-            cmd += ["-b:a", opts["audio_bitrate"]]
-    else:
-        codec_hint = FFMPEG_CONTAINER_CODEC_HINTS.get(target_ext)
-        if codec_hint:
-            cmd += codec_hint
-        if opts.get("bitrate") and opts["bitrate"] != "Auto":
-            cmd += ["-b:a", opts["bitrate"]]
-        if opts.get("sample_rate") and opts["sample_rate"] != "Auto":
-            cmd += ["-ar", str(opts["sample_rate"])]
-        if opts.get("channels") and opts["channels"] != "Auto":
-            cmd += ["-ac", str(opts["channels"])]
-        if not opts.get("preserve_metadata", True):
-            cmd += ["-map_metadata", "-1"]
+    def build_cmd(force_software: bool = False) -> tuple[list[str], str]:
+        cmd = [ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+               "-threads", threads, "-i", str(src)]
+        encoder_used = ""
 
-    cmd += ["-progress", "pipe:1", str(out_path)]
+        if is_gif_target and is_video_source:
+            fps = opts.get("gif_fps", 10)
+            width = opts.get("gif_width", 480)
+            vf = f"fps={fps},scale={width}:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+            cmd += ["-vf", vf, "-loop", "0"]
+        elif is_video_job:
+            vf_parts = []
+            if opts.get("resolution") and opts["resolution"] != "Source":
+                vf_parts.append(f"scale={opts['resolution']}")
+            if vf_parts:
+                cmd += ["-vf", ",".join(vf_parts)]
+            if opts.get("fps") and opts["fps"] != "Source":
+                cmd += ["-r", str(opts["fps"])]
 
-    signals.log.emit("INFO", f"$ {' '.join(cmd)}")
+            codec_opts = dict(opts)
+            if force_software:
+                codec_opts["hw_accel"] = False
+            encode_args, encoder_used = _video_encode_args(target_ext, codec_opts, hw_encoders)
+            cmd += encode_args
+            # Each encoder thread's own "-threads" also needs bounding for
+            # the same oversubscription reason as above (only applies to
+            # software codecs; HW encoders ignore it harmlessly).
+            cmd += ["-threads", threads]
 
-    creationflags = 0
-    if platform.system() == "Windows":
-        creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+            if opts.get("audio_bitrate"):
+                cmd += ["-b:a", opts["audio_bitrate"]]
+        else:
+            codec_hint = FFMPEG_CONTAINER_CODEC_HINTS.get(target_ext)
+            if codec_hint:
+                cmd += codec_hint
+            if opts.get("bitrate") and opts["bitrate"] != "Auto":
+                cmd += ["-b:a", opts["bitrate"]]
+            if opts.get("sample_rate") and opts["sample_rate"] != "Auto":
+                cmd += ["-ar", str(opts["sample_rate"])]
+            if opts.get("channels") and opts["channels"] != "Auto":
+                cmd += ["-ac", str(opts["channels"])]
+            if not opts.get("preserve_metadata", True):
+                cmd += ["-map_metadata", "-1"]
 
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1, creationflags=creationflags,
-    )
-    proc_registry[job.job_id] = proc
+        cmd += ["-progress", "pipe:1", str(out_path)]
+        return cmd, encoder_used
 
-    stderr_lines: list[str] = []
-    last_pct = -1
+    def run_once(cmd: list[str]) -> tuple[int, list[str]]:
+        signals.log.emit("INFO", f"$ {' '.join(cmd)}")
 
-    try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            if token.cancelled:
-                _terminate_process(proc)
-                break
-            line = line.strip()
-            if line.startswith("out_time_ms=") and duration:
-                try:
-                    out_time_ms = int(line.split("=", 1)[1])
-                    pct = min(99, int((out_time_ms / 1_000_000) / duration * 100))
-                    if pct > last_pct:
-                        last_pct = pct
-                        signals.progress.emit(job.job_id, max(0, pct))
-                except Exception:
-                    pass
-            elif line.startswith("progress=") and line.endswith("end"):
-                if last_pct != 100:
-                    last_pct = 100
-                    signals.progress.emit(job.job_id, 100)
+        creationflags = 0
+        if platform.system() == "Windows":
+            creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
 
-        if proc.stderr is not None:
-            stderr_lines = proc.stderr.readlines()
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1, creationflags=creationflags,
+        )
+        proc_registry[job.job_id] = proc
 
-        proc.wait(timeout=10)
-    finally:
-        proc_registry.pop(job.job_id, None)
+        stderr_lines: list[str] = []
+        last_pct = -1
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                if token.cancelled:
+                    _terminate_process(proc)
+                    break
+                line = line.strip()
+                if line.startswith("out_time_ms=") and duration:
+                    try:
+                        out_time_ms = int(line.split("=", 1)[1])
+                        pct = min(99, int((out_time_ms / 1_000_000) / duration * 100))
+                        if pct > last_pct:
+                            last_pct = pct
+                            signals.progress.emit(job.job_id, max(0, pct))
+                    except Exception:
+                        pass
+                elif line.startswith("progress=") and line.endswith("end"):
+                    if last_pct != 100:
+                        last_pct = 100
+                        signals.progress.emit(job.job_id, 100)
+
+            if proc.stderr is not None:
+                stderr_lines = proc.stderr.readlines()
+
+            proc.wait(timeout=10)
+        finally:
+            proc_registry.pop(job.job_id, None)
+
+        return proc.returncode, stderr_lines
 
     if token.cancelled:
         raise InterruptedError("Cancelled by user")
 
-    if proc.returncode != 0:
-        err_text = "".join(stderr_lines).strip() or f"ffmpeg exited with code {proc.returncode}"
+    cmd, encoder_used = build_cmd()
+    returncode, stderr_lines = run_once(cmd)
+
+    # A hardware encoder can fail for reasons that have nothing to do with
+    # the file (driver quirk, VRAM pressure, unsupported pixel format) -
+    # rather than losing the whole job, transparently retry once in
+    # software instead of forcing the user to disable hardware accel.
+    if returncode != 0 and not token.cancelled and encoder_used in HW_VIDEO_ENCODERS:
+        signals.log.emit(
+            "WARNING",
+            f"Hardware encoder {encoder_used} failed for {src.name}, retrying with software encoding…",
+        )
+        if out_path.exists():
+            try:
+                out_path.unlink()
+            except OSError:
+                pass
+        cmd, _ = build_cmd(force_software=True)
+        returncode, stderr_lines = run_once(cmd)
+
+    if token.cancelled:
+        raise InterruptedError("Cancelled by user")
+
+    if returncode != 0:
+        err_text = "".join(stderr_lines).strip() or f"ffmpeg exited with code {returncode}"
         signals.log.emit("ERROR", f"FFmpeg failed for {src.name}: {err_text}\nCommand: {' '.join(cmd)}")
         raise RuntimeError(err_text.splitlines()[-1] if err_text else "FFmpeg conversion failed")
 
@@ -1294,7 +1462,8 @@ class ConversionWorker(QRunnable):
                 if not self.backends.ffmpeg_available:
                     raise RuntimeError("FFmpeg not available. Run: pip install imageio-ffmpeg")
                 out_path = convert_media(job, self.signals, self.token,
-                                         self.backends.ffmpeg_path, self.proc_registry)
+                                         self.backends.ffmpeg_path, self.proc_registry,
+                                         self.backends.hw_video_encoders)
             elif cat == "pdf":
                 if not self.backends.pdf_available:
                     raise RuntimeError("No PDF backend installed. Run: pip install pymupdf")
@@ -1342,6 +1511,7 @@ def default_options() -> dict:
         "sample_rate": "Auto",
         "channels": "Auto",
         "video_preset": "veryfast",
+        "hw_accel": True,
         "resolution": "Source",
         "crf": 23,
         "fps": "Source",
@@ -1508,6 +1678,14 @@ class OptionsDialog(QDialog):
         self.video_preset_combo.addItems(["veryfast", "faster", "fast", "medium", "ultrafast"])
         self.video_preset_combo.setCurrentText("veryfast")
         vid_form.addRow("Encoding speed preset:", self.video_preset_combo)
+        self.hw_accel_cb = QCheckBox("Use hardware acceleration when available (recommended)")
+        self.hw_accel_cb.setChecked(True)
+        self.hw_accel_cb.setToolTip(
+            "Encodes on the GPU (VideoToolbox/NVENC/QSV/AMF) when the machine supports it, "
+            "which is typically several times faster than CPU-only encoding. "
+            "Falls back to software automatically if the hardware encoder fails."
+        )
+        vid_form.addRow(self.hw_accel_cb)
         self.resolution_combo = QComboBox()
         self.resolution_combo.addItems(["Source", "1920:-2", "1280:-2", "854:-2", "640:-2"])
         vid_form.addRow("Resolution:", self.resolution_combo)
@@ -1576,6 +1754,7 @@ class OptionsDialog(QDialog):
         self.sample_rate_combo.setCurrentText(d["sample_rate"])
         self.channels_combo.setCurrentText(d["channels"])
         self.video_preset_combo.setCurrentText(d["video_preset"])
+        self.hw_accel_cb.setChecked(d["hw_accel"])
         self.resolution_combo.setCurrentText(d["resolution"])
         self.crf_spin.setValue(d["crf"])
         self.fps_combo.setCurrentText(d["fps"])
@@ -1604,6 +1783,7 @@ class OptionsDialog(QDialog):
             "sample_rate": self.sample_rate_combo.currentText(),
             "channels": self.channels_combo.currentText(),
             "video_preset": self.video_preset_combo.currentText(),
+            "hw_accel": self.hw_accel_cb.isChecked(),
             "resolution": self.resolution_combo.currentText(),
             "crf": self.crf_spin.value(),
             "fps": self.fps_combo.currentText(),
@@ -2290,6 +2470,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Converting…")
 
         common_options = self._gather_options()
+        # Let each ffmpeg job know how many other jobs may run alongside it,
+        # so it can divide CPU cores instead of every job grabbing all of
+        # them (see _ffmpeg_thread_count).
+        common_options["max_workers"] = max(1, self.thread_pool.maxThreadCount())
 
         for job in pending_jobs:
             job.options.update(common_options)
