@@ -2473,7 +2473,12 @@ class MainWindow(QMainWindow):
         # Let each ffmpeg job know how many other jobs may run alongside it,
         # so it can divide CPU cores instead of every job grabbing all of
         # them (see _ffmpeg_thread_count).
-        common_options["max_workers"] = max(1, self.thread_pool.maxThreadCount())
+        # Divide FFmpeg's CPU budget among jobs that will actually run. Using
+        # the pool's maximum here throttles a single video to one thread when
+        # the default pool has many worker slots.
+        common_options["max_workers"] = max(
+            1, min(self.thread_pool.maxThreadCount(), len(pending_jobs))
+        )
 
         for job in pending_jobs:
             job.options.update(common_options)
