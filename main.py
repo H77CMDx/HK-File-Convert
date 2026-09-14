@@ -115,6 +115,26 @@ ODFPY_AVAILABLE = _module_available("odf")
 APP_NAME = "HK File Converter"
 ORG_NAME = "HK Software"
 
+
+def _resolve_icon_path() -> Optional[Path]:
+    candidates = [
+        Path(__file__).resolve().with_name("icon.ico"),
+        Path.cwd() / "icon.ico",
+        Path(sys.executable).resolve().with_name("icon.ico"),
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _app_icon() -> QIcon:
+    icon_path = _resolve_icon_path()
+    if icon_path is not None:
+        return QIcon(str(icon_path))
+    return QIcon()
+
+
 _ICON_CACHE: dict[tuple[str, int], QIcon] = {}
 
 
@@ -2049,6 +2069,7 @@ class MainWindow(QMainWindow):
         self.options_dialog: Optional[OptionsDialog] = None
 
         self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(_app_icon())
         self.setMinimumSize(900, 600)
         self.resize(1100, 720)
 
@@ -2594,6 +2615,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORG_NAME)
+    app.setWindowIcon(_app_icon())
     window = MainWindow()
     window.show()
     return app.exec()
