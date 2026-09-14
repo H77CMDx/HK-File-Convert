@@ -61,10 +61,19 @@ With the virtual environment activated and PyInstaller installed, run:
 
 ```powershell
 python -m pip install pyinstaller
-.\export.bat
+\.\export pyinstaller.bat
 ```
 
 The batch file creates an onedir, windowed build. It expects `icon.ico` to be present in the project directory.
+
+To create a standalone Nuitka build as a ZIP archive, install Nuitka and run:
+
+```powershell
+python -m pip install nuitka
+\.\export nuitka.bat
+```
+
+This creates `dist\HK File Converter.zip` and preserves the application icon.
 
 ## Features
 
