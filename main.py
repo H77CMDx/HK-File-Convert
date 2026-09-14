@@ -12,8 +12,7 @@ Supports:
     - Presentations(pptx/odp         -> pdf/odp/pptx/txt/html)
 
 Pip dependencies:
-    pip install PySide6 Pillow imageio-ffmpeg
-    pip install pymupdf          # preferred PDF backend (or: pypdfium2)
+    pip install PySide6 Pillow imageio-ffmpeg pymupdf (or: pypdfium2)
 
     # Office / document conversion (pure python):
     pip install python-docx openpyxl python-pptx odfpy fpdf2
@@ -527,7 +526,7 @@ class BackendRegistry:
         return msgs
 
     def startup_report_lines(self) -> list[str]:
-        lines = ["STARTUP CHECK"]
+        lines = ["App by Hiroshi Kelner"]
         lines.append(f"  Python:        {platform.python_version()} ({platform.platform()})")
         lines.append(f"  Pillow:        {'OK v' + str(self.pil_version) if self.pil_available else 'MISSING'}")
         lines.append(f"    HEIC support:  {'yes' if self.heic_supported else 'no'}")
